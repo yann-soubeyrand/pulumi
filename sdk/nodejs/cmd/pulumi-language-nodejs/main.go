@@ -45,6 +45,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -247,6 +248,31 @@ func locateModule(ctx context.Context, mod, programDir, nodeBin string, isPlugin
 	return strings.TrimSpace(string(out)), nil
 }
 
+// locateModuleCached wraps locateModule with a per-host cache keyed on (mod, programDir).
+// This avoids redundant node subprocess spawns when the same module is resolved
+// multiple times (e.g. across preview and update runs for the same program).
+func (host *nodeLanguageHost) locateModuleCached(
+	ctx context.Context, mod, programDir, nodeBin string, isPlugin bool,
+) (string, error) {
+	cacheKey := mod + "\x00" + programDir
+	host.moduleCacheMu.Lock()
+	if cached, ok := host.moduleCache[cacheKey]; ok {
+		host.moduleCacheMu.Unlock()
+		return cached, nil
+	}
+	host.moduleCacheMu.Unlock()
+
+	result, err := locateModule(ctx, mod, programDir, nodeBin, isPlugin)
+	if err != nil {
+		return "", err
+	}
+
+	host.moduleCacheMu.Lock()
+	host.moduleCache[cacheKey] = result
+	host.moduleCacheMu.Unlock()
+	return result, nil
+}
+
 // nodeLanguageHost implements the LanguageRuntimeServer interface
 // for use as an API endpoint.
 type nodeLanguageHost struct {
@@ -259,6 +285,11 @@ type nodeLanguageHost struct {
 
 	// used by language conformance tests to force TSC usage
 	forceTsc bool
+
+	// moduleCache caches the results of locateModule to avoid redundant node subprocess spawns
+	// across multiple Run calls (e.g. preview and update) for the same program directory.
+	moduleCache   map[string]string
+	moduleCacheMu sync.Mutex
 }
 
 type nodeOptions struct {
@@ -361,6 +392,7 @@ func newLanguageHost(
 		otelEndpoint:  otelEndpoint,
 		forceTsc:      forceTsc,
 		runtime:       runtime,
+		moduleCache:   make(map[string]string),
 	}
 }
 
@@ -819,7 +851,7 @@ func (host *nodeLanguageHost) Run(ctx context.Context, req *pulumirpc.RunRequest
 		req.Info.EntryPoint = "bin"
 	}
 
-	runPath, err = locateModule(ctx, runPath, req.Info.ProgramDirectory, runtimeBin, false)
+	runPath, err = host.locateModuleCached(ctx, runPath, req.Info.ProgramDirectory, runtimeBin, false)
 	if err != nil {
 		return &pulumirpc.RunResponse{Error: err.Error()}, nil
 	}
@@ -1186,7 +1218,22 @@ func (host *nodeLanguageHost) InstallDependencies(
 		// program. We probably want to see about making something like this an explicit "pulumi build" step, but for
 		// now shim'ing this in here works well enough for conformance testing. Note that we skip this step when
 		// installing dependencies for plugins, as they may not be written in typescript or have tsc configured.
-		tscCmd := exec.Command("npx", "tsc")
+		//
+		// Use the local tsc binary directly instead of npx to avoid npx's resolution overhead.
+		// Also pass --skipLibCheck to avoid re-checking declaration files from dependencies,
+		// which is a significant time saver.
+		tscBin := filepath.Join(req.Info.ProgramDirectory, "node_modules", ".bin", "tsc")
+		if _, statErr := os.Stat(tscBin); statErr != nil {
+			// Fall back to npx if the local binary doesn't exist
+			tscBin = "npx"
+		}
+		var tscArgs []string
+		if tscBin == "npx" {
+			tscArgs = []string{"tsc", "--skipLibCheck"}
+		} else {
+			tscArgs = []string{"--skipLibCheck"}
+		}
+		tscCmd := exec.Command(tscBin, tscArgs...)
 		tscCmd.Dir = req.Info.ProgramDirectory
 		if err := runWithOutput(tscCmd, stdout, stderr); err != nil {
 			return fmt.Errorf("failed to run tsc: %w", err)
@@ -1900,6 +1947,9 @@ func (host *nodeLanguageHost) Pack(ctx context.Context, req *pulumirpc.PackReque
 		return nil, fmt.Errorf("find npm: %w", err)
 	}
 
+	// Suppress the "new version of npm available" update notification for all npm commands in Pack.
+	npmEnv := append(os.Environ(), "npm_config_update_notifier=false")
+
 	// Annoyingly the engine will call Pack for the core SDK which is not setup in at all the same way as the
 	// generated sdks, so we have to detect that and do a big branch to pack it totally differently.
 	packageJSON, err := readPackageJSON(filepath.Join(req.PackageDirectory, "package.json"))
@@ -1943,7 +1993,7 @@ func (host *nodeLanguageHost) Pack(ctx context.Context, req *pulumirpc.PackReque
 		if err != nil {
 			return nil, fmt.Errorf("write to output: %w", err)
 		}
-		yarnTscCmd := exec.Command(yarn, "run", "tsc")
+		yarnTscCmd := exec.Command(yarn, "run", "tsc", "--skipLibCheck")
 		yarnTscCmd.Dir = req.PackageDirectory
 		if err := runWithOutput(yarnTscCmd, os.Stdout, os.Stderr); err != nil {
 			return nil, fmt.Errorf("yarn run tsc: %w", err)
@@ -1970,8 +2020,10 @@ func (host *nodeLanguageHost) Pack(ctx context.Context, req *pulumirpc.PackReque
 		if err != nil {
 			return nil, fmt.Errorf("write to output: %w", err)
 		}
-		npmInstallCmd := exec.Command(npm, "install")
+		npmInstallCmd := exec.Command(npm, "install",
+			"--no-audit", "--no-fund", "--prefer-offline", "--loglevel=error")
 		npmInstallCmd.Dir = req.PackageDirectory
+		npmInstallCmd.Env = npmEnv
 		if err := runWithOutput(npmInstallCmd, os.Stdout, os.Stderr); err != nil {
 			return nil, errutil.ErrorWithStderr(err, "npm install")
 		}
@@ -1984,6 +2036,7 @@ func (host *nodeLanguageHost) Pack(ctx context.Context, req *pulumirpc.PackReque
 		}
 		npmBuildCmd := exec.Command(npm, "run", "build")
 		npmBuildCmd.Dir = req.PackageDirectory
+		npmBuildCmd.Env = npmEnv
 		if err := runWithOutput(npmBuildCmd, os.Stdout, os.Stderr); err != nil {
 			return nil, errutil.ErrorWithStderr(err, "npm run build")
 		}
@@ -2006,9 +2059,11 @@ func (host *nodeLanguageHost) Pack(ctx context.Context, req *pulumirpc.PackReque
 	npmPackCmd := exec.Command(npm,
 		"pack",
 		filepath.Join(req.PackageDirectory, "bin"),
-		"--pack-destination", req.DestinationDirectory)
+		"--pack-destination", req.DestinationDirectory,
+		"--loglevel=error")
 	npmPackCmd.Stdout = &stdoutBuffer
 	npmPackCmd.Stderr = struct{ io.Writer }{os.Stderr}
+	npmPackCmd.Env = npmEnv
 	err = npmPackCmd.Run()
 	if err != nil {
 		return nil, fmt.Errorf("npm pack: %w", err)
